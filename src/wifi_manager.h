@@ -1,0 +1,25 @@
+#ifndef WIFI_MANAGER_H
+#define WIFI_MANAGER_H
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Preferences.h>
+
+// Status WiFi
+extern bool g_wifi_connected;
+extern char g_wifi_ssid[64];
+extern char g_local_ip[16];
+
+bool wifi_init();
+bool wifi_connect(const char* ssid, const char* password);
+void wifi_maintain();   // watchdog 0.74: reconnect po zerwaniu + twardy reboot gdy WiFi długo down
+bool wifi_has_config();
+void wifi_clear_config();
+void wifi_save_config(const char* ssid, const char* password);
+void wifi_setup_mdns();
+
+// Flaga „deleted" (owner skasował z apki → BE WS „deleted"): node w BLE onboarding, trzyma klucze.
+bool node_deleted_get();
+void node_deleted_set(bool v);
+
+#endif
