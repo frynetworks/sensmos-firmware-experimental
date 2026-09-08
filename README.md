@@ -15,8 +15,8 @@ data peer-to-peer, and earn the GALU token. The network powers
 
 | | |
 |---|---|
-| Version | `0.1.0-esp8266` |
-| Build | `pio run` — clean (Flash 62.8 % of 1 MB, RAM 69.2 % static) |
+| Version | `0.2.0-esp8266` (`src/data_sender.h`) |
+| Build | `pio run` — clean. Shipping build: **54,404 B RAM (66.4 %), 898,839 B flash (86.1 %)** — the TLS build; see [TLS upgrade path](#tls-upgrade-path) |
 | Hardware | flashed and boot-verified on real ESP8266 (ESP-12 / FT232R, 4 MB flash) |
 | Boot QA | 2 consecutive boots, no exceptions / WDT resets, ~17 KB free heap in portal mode |
 | Over-the-air portal test | **not** run by the porting harness — see [Onboarding](#onboarding) |
@@ -63,6 +63,7 @@ identical to the BLE flow's.
 |---|---|---|
 | Provisioning | BLE GATT (NimBLE), `ble_config.cpp` | Captive portal — softAP + DNS catch-all + HTTP form (`captive_portal.cpp`); same JSON command set (`auth`, `set_device_id`, `register`, `trust_round`, `trust_sign`, `wallet_*`, `wifi_set`, `factory_reset`) |
 | Crypto | mbedTLS ECDSA/ECDH/GCM | [micro-ecc](https://github.com/kmackay/micro-ecc) (secp256k1, RFC6979-style deterministic k) + BearSSL (SHA-256, HMAC, AES-128-GCM). **Wire format unchanged**: DER signatures, same HKDF salt/info, same `[ver|seq|tag|ct]` frame |
+| TLS | mbedTLS (ESP-IDF) | **Two stacks, deliberately.** `wss://` runs on **wolfSSL 5.7.2** (`ws_tls.cpp`, `lib_deps`, four `extra_scripts` build hooks) — it is what made TLS fit in this heap. Every one-shot HTTPS call uses the core's bundled **BearSSL** via `WiFiClientSecure` with 512/512 buffers behind heap gates (`HTTPClient.h`, `ota.cpp`, `geolocation.cpp`, `checknet.cpp`). `src/mbedtls/*.h` are shims onto BearSSL/libb64, not a third stack |
 | Storage | NVS via `Preferences` | LittleFS-backed `PrefsStore` with the same API and the same namespaces/keys (binary values base64-encoded) |
 | Async work | FreeRTOS `net_worker` task + queues | Cooperative `net_worker_tick()` — static ring buffers, one job per `loop()` pass |
 | Remote terminal | FreeRTOS task + 4 queues | Single-context tick pump; TCP-window backpressure preserved (reads only what it can forward) |
@@ -105,13 +106,24 @@ src/
   esp8266_compat.h     ESP32→ESP8266 shims (RNG, MAC, heap, chip info)
   WiFi.h WebServer.h HTTPClient.h Preferences.h ESPmDNS.h Update.h mbedtls/
                        header shims so upstream modules compile unchanged
-  ws_tls.*             wolfSSL TLS PoC — gated behind SENSMOS_USE_TLS, see below
+  ws_tls.*             wolfSSL TLS transport for wss:// — SHIPPING, SENSMOS_USE_TLS is on
+                       by default in every env (see TLS upgrade path)
   …                    upstream modules (entity store, scripts, monitors, HTTP API, …)
 tools/
-  gate_heap.py          heap-gate serial harness — see Measured performance
-  patch_wolfssl_settings.py
-                        pre-build hook for the nodemcuv2_tls env (see TLS upgrade path)
+  patch_wolfssl_settings.py    pre-build: wolfSSL user_settings (platformio.ini extra_scripts)
+  patch_websockets_tls.py      pre-build: routes the WebSockets lib through wolfSSL
+  check_cert_expiry.py         pre-build: fails the build on an expired pinned anchor
+  relocate_wolfssl_rodata.py   post-build: moves wolfSSL .rodata out of DRAM
+  gate_heap.py                 heap-gate serial harness — see Measured performance
+  gate_geoloc.py gate_mdns_soak.py gate_soak.py gate_wifi.py
+                               serial gates for geolocation, mDNS, soak and WiFi
+  gen_ca_cert_h.py             regenerates ca_cert.h from the pinned root
+  provision.py cap.py rate.py flash.sh _serialutil.py
+                               provisioning, capture, rate-limit and flashing helpers
 ```
+
+The four `patch_*` / `check_*` / `relocate_*` hooks are **build-critical** — they are wired into
+`platformio.ini` `extra_scripts` and the TLS build does not link without them.
 
 ## Known limitations
 
@@ -189,8 +201,11 @@ exist here:**
 * 60 KB free out of 80 KB total would leave 20 KB for SDK + WiFi + application static — which
   alone consume ~57 KB. The number is unreachable by roughly a factor of three before the first
   `malloc`.
-* This port runs **plaintext WS by design** (`WS_PLAINTEXT=1` in `config.h`) — the ~28 KB TLS
-  handshake spike that motivates the ESP32 rule never happens on the WS path.
+* The ~28 KB **BearSSL** handshake spike that motivates the ESP32 rule never happens on the WS
+  path. This port ships **wolfSSL** for `wss://` instead (see [TLS upgrade path](#tls-upgrade-path)),
+  whose footprint is what made TLS fit here at all. `WS_PLAINTEXT` still exists in `config.h` but
+  is vestigial — `SENSMOS_USE_TLS` is defined in every env and permanently overrides it
+  (`ws_client.cpp`: `#if WS_PLAINTEXT && !defined(SENSMOS_USE_TLS)`).
 * The transport is not unprotected: every frame is already encrypted and authenticated at the
   **application layer** (ECDH + HKDF + AES-128-GCM, `ws_enc.cpp` — see below).
 * No Bluetooth, single-purpose sensor workload — the overhead profile is fundamentally different.
@@ -198,10 +213,12 @@ exist here:**
   connection: Tasmota runs at ~20–26 KB free, ESPHome targets >30 KB. This port's measured
   **~25 KB total addressable** free memory is inside that production-safe range.
 
-**When 60 KB would become relevant here:** if full BearSSL TLS were mandated on the WS
+**When 60 KB would become relevant here:** if full **BearSSL** TLS were mandated on the WS
 connection, its ~28 KB handshake exceeds everything this chip can free — at that point the
-hardware answer is an ESP32/ESP32-C3, and the software answer worth testing first is wolfSSL
-(see the TLS upgrade path below).
+hardware answer would be an ESP32/ESP32-C3. That was the original conclusion; it has since been
+**superseded on the software side**: wolfSSL was tested, fit, and now ships as the WS transport
+(see [TLS upgrade path](#tls-upgrade-path)). BearSSL remains in use for one-shot HTTPS and for
+all crypto primitives, where the handshake spike is bounded by the heap gates instead.
 
 ### Measured performance (after optimization)
 
@@ -270,10 +287,14 @@ at the DNS/routing layer) and **protocol downgrade protection**.
 
 From lightest to heaviest:
 
-**Option 1 — current: plaintext WS + application-layer crypto (recommended on ESP8266).**
+> **Historical note.** Options 1 and 2 below were the analysis *before* wolfSSL was tested.
+> **Option 3 is what actually ships** — `SENSMOS_USE_TLS` is on in every env. They are kept for
+> the reasoning, not as a description of the current build.
+
+**Option 1 — superseded: plaintext WS + application-layer crypto.**
 Zero memory overhead beyond the measured budget; production-safe at ~25 KB total addressable.
-Missing: server certificate verification and downgrade protection. Appropriate while the WS
-endpoint is trusted via DNS/infrastructure security.
+Missing: server certificate verification and downgrade protection. Was appropriate while the WS
+endpoint was trusted via DNS/infrastructure security.
 
 **Option 2 — application-layer key pinning (lightest addition).**
 The ECDH infrastructure already pins the backend's identity key as a compiled constant; this
